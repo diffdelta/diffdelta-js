@@ -1,5 +1,5 @@
 {
-  "name": "diffdelta",
+  "name": "@diffdelta/client",
   "version": "0.1.0",
   "description": "TypeScript client for DiffDelta — agent-ready intelligence feeds",
   "main": "dist/index.js",
