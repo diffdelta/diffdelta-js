@@ -7,6 +7,10 @@
  *
  * const dd = new DiffDelta();
  *
+ * // Quick health check — is the pipeline alive?
+ * const health = await dd.checkHealth();
+ * console.log(`Pipeline: ${health.ok ? "healthy" : "degraded"}, last run: ${health.time}`);
+ *
  * // Poll for new items across all sources
  * const items = await dd.poll();
  * items.forEach(i => console.log(`${i.source}: ${i.headline}`));
@@ -14,16 +18,20 @@
  * // Poll only security sources
  * const sec = await dd.poll({ tags: ["security"] });
  *
+ * // Check what's relevant to your stack
+ * const sources = await dd.discoverSources(["openai", "langchain", "pinecone"]);
+ * console.log("Watch these:", sources);
+ *
  * // Continuous monitoring
  * dd.watch(item => console.log("🚨", item.headline), { tags: ["security"] });
  * ```
  */
 
 import { CursorStore, MemoryCursorStore } from "./cursor.js";
-import type { FeedItem, Feed, Head, SourceInfo } from "./models.js";
-import { parseFeedItem, parseFeed, parseHead, parseSourceInfo } from "./models.js";
+import type { FeedItem, Feed, Head, SourceInfo, HealthCheck } from "./models.js";
+import { parseFeedItem, parseFeed, parseHead, parseSourceInfo, parseHealthCheck } from "./models.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.2";
 const DEFAULT_BASE_URL = "https://diffdelta.io";
 const DEFAULT_TIMEOUT = 15_000; // ms
 
@@ -45,18 +53,18 @@ export interface DiffDeltaOptions {
 export interface PollOptions {
   /** Filter items to these tags (e.g. ["security"]). */
   tags?: string[];
-  /** Filter items to these source IDs (e.g. ["cisa_kev", "nist_nvd"]). */
+  /** Filter items to these source IDs (e.g. ["cisa_kev", "github_advisories"]). */
   sources?: string[];
   /**
    * Which buckets to return.
-   * Defaults to ["new", "updated"].
-   * Use ["new", "updated", "removed"] to include removals.
+   * Defaults to ["new", "updated", "flagged"].
+   * Use ["new", "updated", "removed", "flagged"] to include removals.
    */
-  buckets?: Array<"new" | "updated" | "removed">;
+  buckets?: Array<"new" | "updated" | "removed" | "flagged">;
 }
 
 export interface WatchOptions extends PollOptions {
-  /** Seconds between polls. Defaults to feed TTL (usually 900s). */
+  /** Seconds between polls. Defaults to feed TTL (usually 60s). */
   interval?: number;
   /** If provided, an AbortSignal to stop watching. */
   signal?: AbortSignal;
@@ -99,11 +107,11 @@ export class DiffDelta {
   /**
    * Poll the global feed for new items since last poll.
    *
-   * Checks head.json first (~400 bytes). Only fetches the full feed
+   * Checks head.json first (~200 bytes). Only fetches the full feed
    * if the cursor has changed. Automatically saves the new cursor.
    */
   async poll(options: PollOptions = {}): Promise<FeedItem[]> {
-    const { tags, sources, buckets = ["new", "updated"] } = options;
+    const { tags, sources, buckets = ["new", "updated", "flagged"] } = options;
 
     return this.pollFeed({
       headUrl: `${this.baseUrl}/diff/head.json`,
@@ -125,11 +133,11 @@ export class DiffDelta {
     sourceId: string,
     options: Omit<PollOptions, "sources"> = {}
   ): Promise<FeedItem[]> {
-    const { tags, buckets = ["new", "updated"] } = options;
+    const { tags, buckets = ["new", "updated", "flagged"] } = options;
 
     return this.pollFeed({
-      headUrl: `${this.baseUrl}/diff/source/${sourceId}/head.json`,
-      latestUrl: `${this.baseUrl}/diff/source/${sourceId}/latest.json`,
+      headUrl: `${this.baseUrl}/diff/${sourceId}/head.json`,
+      latestUrl: `${this.baseUrl}/diff/${sourceId}/latest.json`,
       cursorKey: `source:${sourceId}`,
       tags,
       sources: undefined,
@@ -140,7 +148,7 @@ export class DiffDelta {
   // ── Low-level fetch ──
 
   /**
-   * Fetch a head.json pointer.
+   * Fetch a head.json pointer. Cheapest call (~200 bytes).
    * @param url Full URL to head.json. Defaults to global head.
    */
   async head(url?: string): Promise<Head> {
@@ -166,6 +174,50 @@ export class DiffDelta {
     return raw.map(parseSourceInfo);
   }
 
+  // ── Discovery & Health ──
+
+  /**
+   * Check pipeline health. Returns when the engine last ran and whether
+   * all sources are healthy. A stale timestamp means the pipeline is down.
+   */
+  async checkHealth(): Promise<HealthCheck> {
+    const data = await this.fetchJson(`${this.baseUrl}/healthz.json`);
+    return parseHealthCheck(data);
+  }
+
+  /**
+   * Given a list of dependency names your bot uses, returns the source IDs
+   * you should monitor. Uses the static stacks.json mapping — no API call,
+   * pure local lookup after one fetch.
+   *
+   * @example
+   * ```ts
+   * const sources = await dd.discoverSources(["openai", "langchain", "pinecone"]);
+   * // → ["openai_sdk_releases", "openai_api_changelog", "langchain_releases", "pinecone_status"]
+   * ```
+   */
+  async discoverSources(dependencies: string[]): Promise<string[]> {
+    const data = await this.fetchJson(`${this.baseUrl}/diff/stacks.json`);
+    // Support both formats: { dependencies: { x: { sources: [...] } } }
+    // and legacy { dependency_map: { x: [...] } }
+    const depsObj = (data.dependencies || data.dependency_map || {}) as Record<
+      string,
+      { sources?: string[] } | string[]
+    >;
+    const sourceIds = new Set<string>();
+    for (const dep of dependencies) {
+      const entry = depsObj[dep.toLowerCase()];
+      if (!entry) continue;
+      const sources = Array.isArray(entry) ? entry : entry.sources;
+      if (Array.isArray(sources)) {
+        for (const s of sources) {
+          sourceIds.add(s);
+        }
+      }
+    }
+    return [...sourceIds];
+  }
+
   // ── Continuous monitoring ──
 
   /**
@@ -178,6 +230,9 @@ export class DiffDelta {
    * ```ts
    * dd.watch(item => {
    *   console.log(`🚨 ${item.source}: ${item.headline}`);
+   *   if (item.suggestedAction === "PATCH_IMMEDIATELY") {
+   *     triggerAlert(item);
+   *   }
    * }, { tags: ["security"] });
    * ```
    *
@@ -202,7 +257,7 @@ export class DiffDelta {
         const h = await this.head();
         interval = Math.max(h.ttlSec, 60);
       } catch {
-        interval = 900; // default 15 minutes
+        interval = 60; // default 1 minute
       }
     }
 
@@ -216,8 +271,6 @@ export class DiffDelta {
           for (const item of items) {
             await callback(item);
           }
-        } else {
-          console.log(`[diffdelta] No changes.`);
         }
       } catch (err) {
         if (signal?.aborted) break;
@@ -227,10 +280,14 @@ export class DiffDelta {
       // Sleep with abort support
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, interval! * 1000);
-        signal?.addEventListener("abort", () => {
-          clearTimeout(timer);
-          resolve();
-        }, { once: true });
+        signal?.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true }
+        );
       });
     }
 
@@ -260,10 +317,10 @@ export class DiffDelta {
   }): Promise<FeedItem[]> {
     const { headUrl, latestUrl, cursorKey, tags, sources, buckets } = params;
 
-    // Step 1: Fetch head.json (~400 bytes)
+    // Step 1: Fetch head.json (~200 bytes)
     const head = await this.head(headUrl);
 
-    // Step 2: Compare cursor
+    // Step 2: Compare cursor — if unchanged, nothing to do
     const storedCursor = this.cursors.get(cursorKey);
     if (storedCursor && storedCursor === head.cursor) {
       return []; // Nothing changed

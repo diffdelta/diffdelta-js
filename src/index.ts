@@ -20,5 +20,20 @@ export type {
   Feed,
   Head,
   SourceInfo,
+  HealthCheck,
+  Signals,
+  SeveritySignal,
+  ReleaseSignal,
+  IncidentSignal,
+  DeprecationSignal,
+  SignalProvenance,
+  SuggestedAction,
+} from "./models.js";
+export {
+  parseFeedItem,
+  parseFeed,
+  parseHead,
+  parseSourceInfo,
+  parseHealthCheck,
 } from "./models.js";
 export { CursorStore, MemoryCursorStore } from "./cursor.js";
